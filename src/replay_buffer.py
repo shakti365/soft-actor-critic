@@ -48,8 +48,17 @@ class ReplayBuffer:
         self.rewards = []
         self.next_observations = []
 
-    def fetch_sample(self, num_samples=1):
-        pass
+    def fetch_sample(self, num_samples=None):
+
+        if num_samples is None:
+            num_samples = len(current_states)
+
+        idx = np.random.choice(range(len(current_states)), size=num_samples, replace=False)
+        current_states = current_states[idx]
+        actions = actions[idx]
+        rewards = rewards[idx]
+        next_states = next_states[idx]
+        return current_states, actions, rewards, next_states
 
     def save_buffer(self):
         pass
@@ -58,13 +67,3 @@ class ReplayBuffer:
         self.current_episode_id += 1
         self.replay_buffer[self.current_episode_id] = defaultdict(list)
         return self.current_episode_id
-
-    # def init_local_memory(self):
-    #   memory = {
-    #       'steps': [],
-    #       'observations': [],
-    #       'actions': [],
-    #       'rewards': [],
-    #       'next_observations': []
-    #   }
-    #   return memory
