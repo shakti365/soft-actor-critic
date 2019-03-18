@@ -1,20 +1,19 @@
 import gym
-import numpy as np
 
 from replay_buffer import ReplayBuffer
+
 
 class AntAgent:
 
     def __init__(self, render=False, model=None):
         # create an environment
-        self.environment = gym.make('MountainCarContinuous-v0') 
+        self.environment = gym.make('MountainCarContinuous-v0')
         # reset environment when an agent is initialized
         self.current_observation = self.reset_environment()
         self.render = render
         self.model = model
 
         self.buffer = ReplayBuffer()
-
 
     def reset_environment(self):
         current_observation = self.environment.reset()
@@ -26,13 +25,11 @@ class AntAgent:
             action = self.environment.action_space.sample()
         else:
             action = self.model.predict(current_observation)
-        
         return action
 
     def get_transitions(self, action):
         """Take one step in the environment and return the observations"""
         next_observation, reward, done, _ = self.environment.step(action)
-        
         if self.render:
             self.environment.render()
         return next_observation, reward, done
@@ -43,9 +40,9 @@ class AntAgent:
             self.current_observation = self.reset_environment()
             episode_id = self.buffer.create_episode()
 
-            done=False
+            done = False
             transition = dict()
-            
+
             while not done:
                 transition['current_observation'] = self.current_observation
                 transition['action'] = self.get_action(self.current_observation)
@@ -55,8 +52,21 @@ class AntAgent:
 
             self.buffer.add_episode(episode_id)
 
-                # self.store_transition()
+    def learn(self, step=0, restore=False):
+        """Train SAC model using transitions in replay buffer"""
+        if self.model is None:
+            raise Exception("This agent has no brain! Add a model which implements fit() function to train.")
 
-if __name__=="__main__":
+        # Sample array of transitions from replay buffer.
+        transition_matrices = self.buffer.fetch_sample()
+
+        if step != 0:
+            restore = True
+
+        # Fit the SAC model.
+        self.model.fit(transition_matrices, restore=restore, global_step=step)
+
+
+if __name__ == "__main__":
     agent = AntAgent()
     agent.run_episode(num_episodes=2)
