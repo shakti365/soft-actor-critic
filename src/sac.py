@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 import math
+import tensorflow_probability as tfp
 
 class SAC:
 
@@ -68,28 +69,50 @@ class SAC:
 
             return q
 
-    def policy_network(self, current_states, actions, variable_scope, trainable):
-        """Computes probability of taking the action for current_states and given actions"""
+    def policy_network(self, current_states, variable_scope, trainable):
+        """Recommends the best action given the current state."""
         with tf.variable_scope(variable_scope, trainable=trainable):
 
-            # Concatenate current state and action in a vector and pass it to
-            # policy network to observe the probability of taking the action in
-            # the state.
-            state_action = tf.concat(current_states, actions)
-            pie = tf.layers.dense(state_action, 1, activation=tf.nn.sigmoid)
+            # Calculate the parameters of a gausssian to select the best action
+            # give the current state.
+            a = tf.layers.dense(current_states 10, activation=tf.nn.sigmoid)
+            mean = tf.layers.dense(a, self.action_dim,
+                                   activation=tf.nn.relu)
+            std_dev = tf.layers.dense(a, self.action_dim,
+                                   activation=tf.nn.relu)
 
-            return pie
+            return mean, std_dev
+
+    def log_policy(self, current_states):
+        """Computes the log probability of a k dimensional vector""" 
+        # Calculate mean and standard deviation of the gaussian.
+        mean, std_dev = self.policy_network(current_states, variable_scope="policy_network", trainable=False)
+
+        # Sample action from the defined gaussian.
+        action = self.sample_action(mean , std_dev)
+
+        # Calculate log likelihood of a k-dimensional vector.
+        x = tf.pow(action - mean, 2) / tf.pow(std_dev, 2)
+        y = tf.reduce_sum(scaled_action + 2 * tf.log(std_dev))
+        log_pi = -0.5 * (y + self.action_dim * tf.log(2*math.pi))
+
+        return log_pi, action
+
+    def sample_action(self, mean, std_dev):
+        """Samples an action from gaussian."""
+        gaussian = tfp.distributions.Normal(loc=mean, scale=std_dev)
+        action = gaussian.sample(1)
+        return action
 
     def soft_value_function_loss(self, current_states, actions):
         """Computes the loss to update soft value function."""
         with tf.name_scope("value_function_loss"):
             v = self.value_network(current_states,
                                    variable_scope="value_network", trainable=True)
+            log_pi, actions = self.log_policy(current_states)
             q = self.q_network(current_states, actions,
                                variable_scope="q_network", trainable=False)
-            pie = self.policy_network(current_states, actions,
-                                      variable_scope="policy_network", trainable=False)
-            soft_v = tf.reduce_sum(q - tf.log(pie))
+            soft_v = tf.reduce_sum(q - tf.log(pi))
             v_loss_op = tf.reduce_sum(0.5 * tf.pow((v - soft_v), 2))
             return v_loss_op
 
