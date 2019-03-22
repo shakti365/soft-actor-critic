@@ -51,14 +51,14 @@ class ReplayBuffer:
     def fetch_sample(self, num_samples=None):
 
         if num_samples is None:
-            num_samples = len(current_states)
+            num_samples = len(self.observations)
 
-        idx = np.random.choice(range(len(current_states)), size=num_samples, replace=False)
-        current_states = current_states[idx]
-        actions = actions[idx]
-        rewards = rewards[idx]
-        next_states = next_states[idx]
-        return current_states, actions, rewards, next_states
+        idx = np.random.choice(range(len(self.observations)), size=num_samples, replace=False)
+        observations = self.observations[idx]
+        actions = self.actions[idx]
+        rewards = self.rewards[idx]
+        next_observations = self.next_observations[idx]
+        return observations, actions, rewards, next_observations
 
     def save_buffer(self):
         pass
