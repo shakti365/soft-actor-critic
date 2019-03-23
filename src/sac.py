@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import tensorflow as tf
 import math
@@ -7,14 +8,29 @@ import tensorflow_probability as tfp
 class SAC:
 
     def __init__(self, config):
-        self.epochs = config["epochs"]
-        self.learning_rate = config["learning_rate"]
-        self.gamma = config["gamma"]
+        self.epochs = config['epochs']
+        self.learning_rate = config['learning_rate']
+        self.target_update = config['target_update']
+        self.gamma = config['gamma']
+        self.model_name = config['model_name']
+        self.seed = config['seed']
+        self.log_step = config['log_step']
+        self.train_batch_size = config['train_batch_size']
+        self.valid_batch_size = config['valid_batch_size']
+        self.optimizer = config['optimizer']
+        self.initializer = config['initializer']
+        self.logs_path = config['logs_path']
+        self.SERVING_DIR = os.path.join(self.logs_path, self.model_name+'_serving', '1')
+        self.TF_SUMMARY_DIR = os.path.join(self.logs_path, self.model_name+'_summary')
+        self.CKPT_DIR = os.path.join(self.logs_path, self.model_name+'_checkpoint')
+        self.split = config['split']
         self.action_dim = 1
-        self.seed = 1
-        self.train_batch_size = 512
-        self.valid_batch_size = 512
-        self.optimizer = 'sgd'
+
+        self.INITIALIZERS = {
+            'xavier': tf.glorot_uniform_initializer(), 
+            'uniform': tf.random_uniform_initializer(-1, 1)
+        }
+
         self.OPTIMIZERS = {
             'sgd': tf.train.GradientDescentOptimizer(self.learning_rate),
             'adam': tf.train.AdamOptimizer(self.learning_rate),
@@ -23,11 +39,20 @@ class SAC:
             'adagrad': tf.train.AdagradOptimizer(self.learning_rate)
         }
 
+        self.LOSSES = {
+            'mse': tf.losses.mean_squared_error,
+            'huber': tf.losses.huber_loss
+        }
+
+        if self.optimizer not in self.OPTIMIZERS.keys():
+            raise ValueError("optimizer should be in {}".format(self.OPTIMIZERS.keys()))
+        
+        if self.logs_path is None:
+            raise ValueError("export_dir cannot be empty")
 
     def input_fn(self, transition_matrices):
 
         # Fetch current_state, action, reward and next_state matrices.
-        print (len(transition_matrices))
         current_states, actions, rewards, next_states = transition_matrices
 
         current_states = current_states.astype(np.float32)
@@ -39,7 +64,7 @@ class SAC:
         actions = actions.astype(np.int32)
 
         # Split dataset into train and validation set.
-        split_percentage = 0.8
+        split_percentage = self.split
         num_samples = len(current_states)
         train_size = int(split_percentage * num_samples)
         valid_size = int((1-split_percentage) * num_samples)
@@ -64,29 +89,28 @@ class SAC:
 
         return train_init_op, valid_init_op, data_iter
 
-    def value_network(self, current_states, variable_scope, trainable):
+    def value_network(self, current_states, variable_scope):
         """Computes value function at a given state"""
         with tf.variable_scope(variable_scope, reuse=tf.AUTO_REUSE):
 
             # Value function estimate for the current state.
-            v = tf.layers.dense(current_states, 1, activation=tf.nn.relu, trainable=trainable)
+            v = tf.layers.dense(current_states, 1, activation=tf.nn.relu)
         return v
 
-    def q_network(self, current_states, actions, variable_scope, trainable):
+    def q_network(self, current_states, actions, variable_scope):
         """Computes the action-value function (Q value) at a given state and
         action"""
         with tf.variable_scope(variable_scope, reuse=tf.AUTO_REUSE):
 
             # Concatenate current state and action in a vector and pass it to Q
             # network to observe Q value.
-            print (current_states, actions)
             state_action = tf.concat([current_states, tf.cast(actions,
                                                               dtype=tf.float32)], axis=1)
-            q = tf.layers.dense(state_action, 1, activation=tf.nn.relu, trainable=trainable)
+            q = tf.layers.dense(state_action, 1, activation=tf.nn.relu)
 
             return q
 
-    def policy_network(self, current_states, variable_scope, trainable):
+    def policy_network(self, current_states, variable_scope):
         """Recommends the best action given the current state."""
         with tf.variable_scope(variable_scope, reuse=tf.AUTO_REUSE):
 
@@ -94,21 +118,20 @@ class SAC:
             # give the current state.
             a = tf.layers.dense(current_states, 10, activation=tf.nn.sigmoid)
             mean = tf.layers.dense(a, self.action_dim,
-                                   activation=tf.nn.relu, trainable=trainable)
+                                   activation=tf.nn.relu)
             std_dev = tf.layers.dense(a, self.action_dim,
-                                   activation=tf.nn.relu, trainable=trainable)
+                                   activation=tf.nn.relu)
 
             return mean, std_dev
 
-    def log_policy(self, current_states, trainable):
+    def log_policy(self, current_states):
         """Computes the log probability of a k dimensional vector""" 
         # Calculate mean and standard deviation of the gaussian.
         mean, std_dev = self.policy_network(current_states,
-                                            variable_scope="policy_network",
-                                            trainable=trainable)
+                                            variable_scope="policy_network")
 
         # Sample action from the defined gaussian.
-        action = self.sample_action(mean , std_dev)
+        action = self.sample_action(mean, std_dev)
 
         # Calculate log likelihood of a k-dimensional vector.
         x = tf.pow(action - mean, 2) / tf.pow(std_dev, 2)
@@ -128,37 +151,36 @@ class SAC:
         """Computes the loss to update soft value function."""
         with tf.name_scope("value_function_loss"):
             v = self.value_network(current_states,
-                                   variable_scope="value_network", trainable=True)
-            log_pi, actions = self.log_policy(current_states, trainable=False)
-            q = self.q_network(current_states, actions,
-                               variable_scope="q_network", trainable=False)
+                                   variable_scope="value_network")
+            log_pi, actions = self.log_policy(current_states)
+            q = tf.stop_gradient(self.q_network(current_states, actions,
+                               variable_scope="q_network"))
             soft_v = tf.reduce_sum(q - log_pi)
-            v_loss_op = tf.reduce_sum(0.5 * tf.pow((v - soft_v), 2))
+            v_loss_op = tf.reduce_sum(0.5 * tf.pow((v -
+                                                    tf.stop_gradient(soft_v)), 2))
             return v_loss_op
 
     def soft_q_function_loss(self, current_states, actions, rewards, next_states):
         """Computes the loss to update soft Q function."""
         with tf.name_scope("q_function_loss"):
-            v_target = self.value_network(next_states,
-                                   variable_scope="target_value_network",
-                                   trainable=False)
+            v_target = self.value_network(next_states, variable_scope="target_value_network")
             q = self.q_network(current_states, actions,
-                               variable_scope="q_network", trainable=True)
+                               variable_scope="q_network")
             q_target = rewards + self.gamma * tf.reduce_sum(v_target)
-            q_loss_op = tf.reduce_sum(0.5 * tf.pow((q - q_target), 2))
+            q_loss_op = tf.reduce_sum(0.5 * tf.pow((q -
+                                                    tf.stop_gradient(q_target)), 2))
             return q_loss_op
 
     def policy_network_loss(self, current_states):
         """Computes the KL divergence loss between policy network and Q network"""
         with tf.name_scope("policy_network_loss"):
 
-            log_pi, actions = self.log_policy(current_states, trainable=True)
-            q = self.q_network(current_states, actions,
-                               variable_scope="q_network", trainable=False)
-            policy_loss_op = tf.reduce_sum(log_pi - q)
+            log_pi, actions = self.log_policy(current_states)
+            q = self.q_network(current_states, actions, variable_scope="q_network")
+            policy_loss_op = tf.reduce_sum(log_pi - tf.stop_gradient(q))
             return policy_loss_op
 
-    def optimize_fn(self, loss):
+    def optimize_fn(self, v_loss_op, q_loss_op, policy_loss_op):
         """
         Optimization function for the Backpropagation. 
         Dervied class can override this function to implement custom changes to optimization.
@@ -178,23 +200,25 @@ class SAC:
             # Select the optimizer.
             optimizer = self.OPTIMIZERS[self.optimizer]
 
+            v_optimize_op = optimizer.minimize(v_loss_op)
+            q_optimize_op = optimizer.minimize(q_loss_op)
+            policy_optimize_op = optimizer.minimize(policy_loss_op)
             # Minimize loss based on optimizer. 
             #optimize_op = optimizer.minimize(loss)
 
             # Calculate gradients using the optimizer and the loss function.
-            gradients = optimizer.compute_gradients(loss)
-            
+            # gradients = optimizer.compute_gradients(loss)
+
             # Clip gradients by value.
-            clipped_gradients = [(tf.clip_by_value(grad, -10., 10.), var) for grad, var in gradients]
+            # clipped_gradients = [(tf.clip_by_value(grad, -10., 10.), var) for grad, var in gradients]
 
             # Apply clipped gradients.
-            optimize_op = optimizer.apply_gradients(clipped_gradients)
+            # optimize_op = optimizer.apply_gradients(clipped_gradients)
 
             # Add summaries of gradients to tensorboard.
-            utils.gradient_summaries(clipped_gradients)
-
+            # utils.gradient_summaries(clipped_gradients)
+            optimize_op = tf.group(v_optimize_op, q_optimize_op, policy_optimize_op)
             return optimize_op
-
 
     def train(self, current_states, actions, rewards, next_states):
 
@@ -209,25 +233,25 @@ class SAC:
         policy_loss_op = self.policy_network_loss(current_states)
 
         # Combine all the loss operations
-        loss = tf.group(v_loss_op, q_loss_op, policy_loss_op)
+        optimize_op = self.optimize_fn(v_loss_op, q_loss_op, policy_loss_op)
 
         # Create optimization operation.
-        optimize_op = self.optimize_fn(loss)
+        # optimize_op = self.optimize_fn(loss)
 
         # Log loss in tensorboard summary.
-        mean_loss, mean_loss_update_op = utils.avg_loss(loss)
-        tf.summary.scalar('mean_loss', mean_loss)
-        tf.summary.scalar('loss', loss)
-
+        #mean_loss, mean_loss_update_op = utils.avg_loss(loss)
+        #tf.summary.scalar('mean_loss', mean_loss)
+        tf.summary.scalar('loss', v_loss_op)
+        tf.summary.scalar('loss', q_loss_op)
+        tf.summary.scalar('loss', policy_loss_op)
         # Summaries for all the trainable variables.
-        utils.parameter_summaries(tf.trainable_variables())
+        #utils.parameter_summaries(tf.trainable_variables())
 
         # TODO: Add tensorboard model evaluation metrics.
 
         summary = tf.summary.merge_all()
 
-        return optimize_op, loss, summary
-
+        return optimize_op, v_loss_op, q_loss_op, policy_loss_op, summary
 
     def copy(self, primary_scope, target_scope):
 
@@ -281,7 +305,7 @@ class SAC:
         current_states, actions, rewards, next_states = data_iter.get_next()
 
         # Get loss and optimization ops
-        optimize_op, loss, summary = self.train(current_states, actions, rewards, next_states)
+        optimize_op, v_loss_op, q_loss_op, policy_loss_op, summary = self.train(current_states, actions, rewards, next_states)
 
         # Object to saver model checkpoints
         self.saver = tf.train.Saver()
@@ -311,13 +335,14 @@ class SAC:
 
                 for batch in range(self.num_train_batches):
 
-                    train_loss, train_summary, _ = sess.run([loss, summary, optimize_op])
+                    train_loss, train_loss_2, train_loss_3, train_summary, _ = sess.run([v_loss_op, q_loss_op, policy_loss_op, summary, optimize_op])
+                    print (train_loss, train_loss_2, train_loss_3)
 
                     # Log training dataset.
                     train_writer.add_summary(train_summary, step)
 
                     # Check if step to update Q target.
-                    if step % self.update_step == 0:
+                    if step % self.target_update == 0:
                         sess.run(copy_op)
 
                     step +=1
@@ -330,7 +355,7 @@ class SAC:
                     sess.run(valid_init_op)
 
                     # Get results on validation set.
-                    valid_loss, valid_summary = sess.run([loss, summary])
+                    valid_loss, valid_summary = sess.run([q_loss_op, summary])
 
                     # Log validation dataset.
                     valid_writer.add_summary(valid_summary, step)
@@ -348,10 +373,9 @@ class SAC:
 
         # Create iterator.
         # current_states, _, _, _ = data_iter.get_next()
-        print (test_X.shape)
-        current_states = tf.placeholder(shape=[None, 4], dtype=tf.float32)
+        current_states = tf.placeholder(shape=[None, 2], dtype=tf.float32)
 
-        _, action = self.log_policy(current_states, trainable=False)
+        _, action = self.log_policy(current_states)
 
         # Object to saver model checkpoints
         self.saver = tf.train.Saver()
@@ -361,5 +385,6 @@ class SAC:
             self.saver.restore(sess, self.CKPT_DIR+"{}.ckpt".format(self.model_name))
 
             # Result on test set batch.
-            action_test = sess.run([action], {current_states: test_X.reshape(-1, 4)})
+            action_test = sess.run([action], {current_states:
+                                              test_X.reshape(-1, 2)})
         return action_test[0]
