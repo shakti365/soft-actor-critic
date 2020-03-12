@@ -3,7 +3,9 @@ import numpy as np
 import tensorflow as tf
 import math
 import tensorflow_probability as tfp
+import logging
 
+logging.basicConfig(level=logging.DEBUG)
 
 class SAC:
 
@@ -116,11 +118,9 @@ class SAC:
 
             # Calculate the parameters of a gausssian to select the best action
             # give the current state.
-            a = tf.layers.dense(current_states, 10, activation=tf.nn.sigmoid)
-            mean = tf.layers.dense(a, self.action_dim,
-                                   activation=tf.nn.relu)
-            std_dev = tf.layers.dense(a, self.action_dim,
-                                   activation=tf.nn.relu)
+            a = tf.layers.dense(current_states, 10, activation=tf.nn.relu)
+            mean = tf.layers.dense(a, self.action_dim)
+            std_dev = tf.layers.dense(a, self.action_dim)
 
             return mean, std_dev
 
@@ -131,12 +131,7 @@ class SAC:
                                             variable_scope="policy_network")
 
         # Sample action from the defined gaussian.
-        action = self.sample_action(mean, std_dev)
-
-        # Calculate log likelihood of a k-dimensional vector.
-        x = tf.pow(action - mean, 2) / tf.pow(std_dev, 2)
-        y = tf.reduce_sum(x + 2 * tf.log(std_dev))
-        log_pi = -0.5 * (y + self.action_dim * tf.log(2*math.pi))
+        action, log_pi = self.sample_action(mean, std_dev)
 
         return log_pi, action
 
@@ -145,7 +140,8 @@ class SAC:
         gaussian = tfp.distributions.Normal(loc=mean, scale=std_dev)
         # TODO add tanh squashing here.
         action = gaussian.sample()
-        return action
+        log_prob = gaussian.log_prob(action)
+        return action, log_prob
 
     def soft_value_function_loss(self, current_states):
         """Computes the loss to update soft value function."""
@@ -203,47 +199,32 @@ class SAC:
             v_optimize_op = optimizer.minimize(v_loss_op)
             q_optimize_op = optimizer.minimize(q_loss_op)
             policy_optimize_op = optimizer.minimize(policy_loss_op)
-            # Minimize loss based on optimizer. 
-            #optimize_op = optimizer.minimize(loss)
-
-            # Calculate gradients using the optimizer and the loss function.
-            # gradients = optimizer.compute_gradients(loss)
-
-            # Clip gradients by value.
-            # clipped_gradients = [(tf.clip_by_value(grad, -10., 10.), var) for grad, var in gradients]
-
-            # Apply clipped gradients.
-            # optimize_op = optimizer.apply_gradients(clipped_gradients)
-
-            # Add summaries of gradients to tensorboard.
-            # utils.gradient_summaries(clipped_gradients)
             optimize_op = tf.group(v_optimize_op, q_optimize_op, policy_optimize_op)
             return optimize_op
+
 
     def train(self, current_states, actions, rewards, next_states):
 
         # Create loss operation for value function update.
         v_loss_op = self.soft_value_function_loss(current_states)
 
+
+
         # Create loss operation for Q function update.
         q_loss_op = self.soft_q_function_loss(current_states, actions, rewards,
                                              next_states)
 
-        # TODO Create loss operation for policy network update.
+        # Create loss operation for policy network update.
         policy_loss_op = self.policy_network_loss(current_states)
 
         # Combine all the loss operations
         optimize_op = self.optimize_fn(v_loss_op, q_loss_op, policy_loss_op)
 
-        # Create optimization operation.
-        # optimize_op = self.optimize_fn(loss)
-
         # Log loss in tensorboard summary.
-        #mean_loss, mean_loss_update_op = utils.avg_loss(loss)
-        #tf.summary.scalar('mean_loss', mean_loss)
         tf.summary.scalar('loss', v_loss_op)
         tf.summary.scalar('loss', q_loss_op)
         tf.summary.scalar('loss', policy_loss_op)
+        
         # Summaries for all the trainable variables.
         #utils.parameter_summaries(tf.trainable_variables())
 
@@ -271,120 +252,3 @@ class SAC:
             copy_op = tf.group(*assign_ops)
 
             return copy_op
-
-    def fit(self, transition_matrices, restore=False, global_step=0):
-
-        # Check if the export directory is present,
-        # if not present create new directory.
-        # if os.path.exists(self.export_dir) and restore is False:
-        #     raise ValueError("Export directory already exists. Please specify different export directory.")
-        # elif os.path.exists(self.export_dir) and restore:
-        #     print ("Restoring model from latest checkpoint.")
-        #     pass
-        # else:
-        #     os.mkdir(self.export_dir)
-
-        # self.builder=tf.saved_model.builder.SavedModelBuilder(self.SERVING_DIR)
-
-        # Save model config
-        # params = self.get_params()
-        # with open(os.path.join(self.export_dir, 'params.json'), 'wb') as f:
-        #     json.dump(params, f)
-
-
-        # Clear deafult graph stack and reset global graph definition.
-        tf.reset_default_graph()
-
-        # Set seed for random.
-        tf.set_random_seed(self.seed)
-
-        # Get data iterator ops.
-        train_init_op, valid_init_op, data_iter = self.input_fn(transition_matrices)
-
-        # Create iterator.
-        current_states, actions, rewards, next_states = data_iter.get_next()
-
-        # Get loss and optimization ops
-        optimize_op, v_loss_op, q_loss_op, policy_loss_op, summary = self.train(current_states, actions, rewards, next_states)
-
-        # Object to saver model checkpoints
-        self.saver = tf.train.Saver()
-
-        with tf.Session() as sess:
-            # Initialize variables in graph.
-            sess.run(tf.global_variables_initializer())
-            sess.run(tf.local_variables_initializer())
-
-            # Restore model checkpoint.
-            if restore:
-                self.saver.restore(sess, self.CKPT_DIR+"{}.ckpt".format(self.model_name))
-
-            # Create file writer directory to store summary and events.
-            train_writer = tf.summary.FileWriter(self.TF_SUMMARY_DIR+'/train', sess.graph)
-            valid_writer = tf.summary.FileWriter(self.TF_SUMMARY_DIR+'/valid')
-
-            # Create model copy op.
-            copy_op = self.copy(primary_scope='primary', target_scope='target')
-
-            # Initialize step count.
-            step = global_step
-            for epoch in range(self.epochs):
-
-                # Initialize training set iterator.
-                sess.run(train_init_op)
-
-                for batch in range(self.num_train_batches):
-
-                    train_loss, train_loss_2, train_loss_3, train_summary, _ = sess.run([v_loss_op, q_loss_op, policy_loss_op, summary, optimize_op])
-                    print (train_loss, train_loss_2, train_loss_3)
-
-                    # Log training dataset.
-                    train_writer.add_summary(train_summary, step)
-
-                    # Check if step to update Q target.
-                    if step % self.target_update == 0:
-                        sess.run(copy_op)
-
-                    step +=1
-
-                # Log results every step.
-                if epoch % self.log_step == 0:
-
-                    # Get validation set.
-                    # Initialize training set iterator.
-                    sess.run(valid_init_op)
-
-                    # Get results on validation set.
-                    valid_loss, valid_summary = sess.run([q_loss_op, summary])
-
-                    # Log validation dataset.
-                    valid_writer.add_summary(valid_summary, step)
-
-            # Save model checkpoint.
-            self.saver.save(sess, self.CKPT_DIR+"{}.ckpt".format(self.model_name))
-            return step
-
-    def predict(self, test_X):
-        # Clear deafult graph stack and reset global graph definition.
-        tf.reset_default_graph()
-
-        # Get data iterator ops.
-        # _, _, data_iter = self.input_fn(transition_matrices)
-
-        # Create iterator.
-        # current_states, _, _, _ = data_iter.get_next()
-        current_states = tf.placeholder(shape=[None, 2], dtype=tf.float32)
-
-        _, action = self.log_policy(current_states)
-
-        # Object to saver model checkpoints
-        self.saver = tf.train.Saver()
-
-        with tf.Session() as sess:
-            # Restore model checkpoint.
-            self.saver.restore(sess, self.CKPT_DIR+"{}.ckpt".format(self.model_name))
-
-            # Result on test set batch.
-            action_test = sess.run([action], {current_states:
-                                              test_X.reshape(-1, 2)})
-        return action_test[0]

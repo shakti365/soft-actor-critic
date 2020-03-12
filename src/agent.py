@@ -3,7 +3,7 @@ import gym
 from replay_buffer import ReplayBuffer
 
 
-class AntAgent:
+class Agent:
 
     def __init__(self, render=False, model=None):
         # create an environment
@@ -19,9 +19,9 @@ class AntAgent:
         current_observation = self.environment.reset()
         return current_observation
 
-    def get_action(self, current_observation):
+    def get_action(self, current_observation, random=False):
         """Fetch an action according to model policy"""
-        if self.model is None:
+        if random:
             action = self.environment.action_space.sample()
         else:
             action = self.model.predict(current_observation)
@@ -68,5 +68,5 @@ class AntAgent:
 
 
 if __name__ == "__main__":
-    agent = AntAgent()
+    agent = Agent()
     agent.run_episode(num_episodes=2)
