@@ -18,7 +18,7 @@ pyglet==1.5.0
 requests==2.23.0
 six==1.14.0
 tensorboard==1.13.1
-tensorflow==1.13.1
+tensorflow==1.15.2
 tensorflow-estimator==1.13.0
 tensorflow-probability==0.6.0
 termcolor==1.1.0
