@@ -1,254 +1,248 @@
-import os
-import numpy as np
 import tensorflow as tf
-import math
 import tensorflow_probability as tfp
-import logging
+from tensorflow.keras import layers
+from tensorflow.keras import Model
+import numpy as np
 
-logging.basicConfig(level=logging.DEBUG)
+tf.keras.backend.set_floatx('float64')
 
-class SAC:
+EPSILON = 1e-16
 
-    def __init__(self, config):
-        self.epochs = config['epochs']
-        self.learning_rate = config['learning_rate']
-        self.target_update = config['target_update']
-        self.gamma = config['gamma']
-        self.model_name = config['model_name']
-        self.seed = config['seed']
-        self.log_step = config['log_step']
-        self.train_batch_size = config['train_batch_size']
-        self.valid_batch_size = config['valid_batch_size']
-        self.optimizer = config['optimizer']
-        self.initializer = config['initializer']
-        self.logs_path = config['logs_path']
-        self.SERVING_DIR = os.path.join(self.logs_path, self.model_name+'_serving', '1')
-        self.TF_SUMMARY_DIR = os.path.join(self.logs_path, self.model_name+'_summary')
-        self.CKPT_DIR = os.path.join(self.logs_path, self.model_name+'_checkpoint')
-        self.split = config['split']
-        self.action_dim = 1
+class Actor(Model):
 
-        self.INITIALIZERS = {
-            'xavier': tf.glorot_uniform_initializer(), 
-            'uniform': tf.random_uniform_initializer(-1, 1)
-        }
+    def __init__(self, action_dim):
+        super().__init__()
+        self.action_dim = action_dim
+        self.dense1_layer = layers.Dense(32, activation=tf.nn.relu)
+        self.dense2_layer = layers.Dense(32, activation=tf.nn.relu)
+        self.mean_layer = layers.Dense(self.action_dim)
+        self.stdev_layer = layers.Dense(self.action_dim)
 
-        self.OPTIMIZERS = {
-            'sgd': tf.train.GradientDescentOptimizer(self.learning_rate),
-            'adam': tf.train.AdamOptimizer(self.learning_rate),
-            'sgd_mom': tf.train.MomentumOptimizer(self.learning_rate, momentum=0.9, use_nesterov=True),
-            'rmsprop': tf.train.RMSPropOptimizer(self.learning_rate),
-            'adagrad': tf.train.AdagradOptimizer(self.learning_rate)
-        }
+    def call(self, state):
+        # Get mean and standard deviation from the policy network
+        a1 = self.dense1_layer(state)
+        a2 = self.dense2_layer(a1)
+        mu = self.mean_layer(a2)
 
-        self.LOSSES = {
-            'mse': tf.losses.mean_squared_error,
-            'huber': tf.losses.huber_loss
-        }
+        # Standard deviation is bounded by a constraint of being non-negative
+        # therefore we produce log stdev as output which can be [-inf, inf]
+        log_sigma = self.stdev_layer(a2)
+        sigma = tf.exp(log_sigma)
 
-        if self.optimizer not in self.OPTIMIZERS.keys():
-            raise ValueError("optimizer should be in {}".format(self.OPTIMIZERS.keys()))
-        
-        if self.logs_path is None:
-            raise ValueError("export_dir cannot be empty")
+        # Use re-parameterization trick to deterministically sample action from
+        # the policy network. First, sample from a Normal distribution of
+        # sample size as the action and multiply it with stdev
+        dist = tfp.distributions.Normal(mu, sigma)
+        action_ = dist.sample()
 
-    def input_fn(self, transition_matrices):
+        # Apply the tanh squashing to keep the gaussian bounded in (-1,1)
+        action = tf.tanh(action_)
 
-        # Fetch current_state, action, reward and next_state matrices.
-        current_states, actions, rewards, next_states = transition_matrices
+        # Calculate the log probability
+        log_pi_ = dist.log_prob(action_)
+        # Change log probability to account for tanh squashing as mentioned in
+        # Appendix C of the paper
+        log_pi = log_pi_ - tf.reduce_sum(tf.math.log(1 - action**2 + EPSILON), axis=1,
+                                         keepdims=True)
 
-        current_states = current_states.astype(np.float32)
-        actions = actions.astype(np.float32)
-        rewards = rewards.astype(np.float32)
-        next_states = next_states.astype(np.float32)
+        return action, log_pi
 
-        # Convert action dtype for indexing.
-        actions = actions.astype(np.int32)
+    @property
+    def trainable_variables(self):
+        return self.dense1_layer.trainable_variables + \
+                self.dense1_layer.trainable_variables + \
+                self.mean_layer.trainable_variables + \
+                self.stdev_layer.trainable_variables
 
-        # Split dataset into train and validation set.
-        split_percentage = self.split
-        num_samples = len(current_states)
-        train_size = int(split_percentage * num_samples)
-        valid_size = int((1-split_percentage) * num_samples)
-        train_set = (current_states[:train_size], actions[:train_size], rewards[:train_size], next_states[:train_size])
-        valid_set = (current_states[-valid_size:], actions[-valid_size:], rewards[-valid_size:], next_states[-valid_size:])
+class Critic(Model):
 
-        # Calculate number of train batches.
-        self.num_train_batches = int(math.ceil(train_size / float(self.train_batch_size)))
-        # Calculate number of valid batches.
-        self.num_valid_batches = int(math.ceil(valid_size / float(self.valid_batch_size)))
+    def __init__(self):
+        super().__init__()
+        self.dense1_layer = layers.Dense(32, activation=tf.nn.relu)
+        self.dense2_layer = layers.Dense(32, activation=tf.nn.relu)
+        self.output_layer = layers.Dense(1)
 
-        # Create Dataset object from input.
-        train_dataset = tf.data.Dataset.from_tensor_slices(train_set).batch(self.train_batch_size)
-        valid_dataset = tf.data.Dataset.from_tensor_slices(valid_set).batch(self.valid_batch_size)
+    def call(self, state, action):
+        state_action = tf.concat([state, action], axis=1)
+        a1 = self.dense1_layer(state_action)
+        a2 = self.dense2_layer(a1)
+        q = self.output_layer(a2)
+        return q
 
-        # Create generic iterator.
-        data_iter = tf.data.Iterator.from_structure(train_dataset.output_types, train_dataset.output_shapes)
-
-        # Create initialisation operations.
-        train_init_op = data_iter.make_initializer(train_dataset)
-        valid_init_op = data_iter.make_initializer(valid_dataset)
-
-        return train_init_op, valid_init_op, data_iter
-
-    def value_network(self, current_states, variable_scope):
-        """Computes value function at a given state"""
-        with tf.variable_scope(variable_scope, reuse=tf.AUTO_REUSE):
-
-            # Value function estimate for the current state.
-            v = tf.layers.dense(current_states, 1, activation=tf.nn.relu)
-        return v
-
-    def q_network(self, current_states, actions, variable_scope):
-        """Computes the action-value function (Q value) at a given state and
-        action"""
-        with tf.variable_scope(variable_scope, reuse=tf.AUTO_REUSE):
-
-            # Concatenate current state and action in a vector and pass it to Q
-            # network to observe Q value.
-            state_action = tf.concat([current_states, tf.cast(actions,
-                                                              dtype=tf.float32)], axis=1)
-            q = tf.layers.dense(state_action, 1, activation=tf.nn.relu)
-
-            return q
-
-    def policy_network(self, current_states, variable_scope):
-        """Recommends the best action given the current state."""
-        with tf.variable_scope(variable_scope, reuse=tf.AUTO_REUSE):
-
-            # Calculate the parameters of a gausssian to select the best action
-            # give the current state.
-            a = tf.layers.dense(current_states, 10, activation=tf.nn.relu)
-            mean = tf.layers.dense(a, self.action_dim)
-            std_dev = tf.layers.dense(a, self.action_dim)
-
-            return mean, std_dev
-
-    def log_policy(self, current_states):
-        """Computes the log probability of a k dimensional vector""" 
-        # Calculate mean and standard deviation of the gaussian.
-        mean, std_dev = self.policy_network(current_states,
-                                            variable_scope="policy_network")
-
-        # Sample action from the defined gaussian.
-        action, log_pi = self.sample_action(mean, std_dev)
-
-        return log_pi, action
-
-    def sample_action(self, mean, std_dev):
-        """Samples an action from gaussian."""
-        gaussian = tfp.distributions.Normal(loc=mean, scale=std_dev)
-        # TODO add tanh squashing here.
-        action = gaussian.sample()
-        log_prob = gaussian.log_prob(action)
-        return action, log_prob
-
-    def soft_value_function_loss(self, current_states):
-        """Computes the loss to update soft value function."""
-        with tf.name_scope("value_function_loss"):
-            v = self.value_network(current_states,
-                                   variable_scope="value_network")
-            log_pi, actions = self.log_policy(current_states)
-            q = tf.stop_gradient(self.q_network(current_states, actions,
-                               variable_scope="q_network"))
-            soft_v = tf.reduce_sum(q - log_pi)
-            v_loss_op = tf.reduce_sum(0.5 * tf.pow((v -
-                                                    tf.stop_gradient(soft_v)), 2))
-            return v_loss_op
-
-    def soft_q_function_loss(self, current_states, actions, rewards, next_states):
-        """Computes the loss to update soft Q function."""
-        with tf.name_scope("q_function_loss"):
-            v_target = self.value_network(next_states, variable_scope="target_value_network")
-            q = self.q_network(current_states, actions,
-                               variable_scope="q_network")
-            q_target = rewards + self.gamma * tf.reduce_sum(v_target)
-            q_loss_op = tf.reduce_sum(0.5 * tf.pow((q -
-                                                    tf.stop_gradient(q_target)), 2))
-            return q_loss_op
-
-    def policy_network_loss(self, current_states):
-        """Computes the KL divergence loss between policy network and Q network"""
-        with tf.name_scope("policy_network_loss"):
-
-            log_pi, actions = self.log_policy(current_states)
-            q = self.q_network(current_states, actions, variable_scope="q_network")
-            policy_loss_op = tf.reduce_sum(log_pi - tf.stop_gradient(q))
-            return policy_loss_op
-
-    def optimize_fn(self, v_loss_op, q_loss_op, policy_loss_op):
-        """
-        Optimization function for the Backpropagation. 
-        Dervied class can override this function to implement custom changes to optimization.
-        
-        Parameters
-        ----------
-            loss: Tensor shape=[1,1]
-                Computed loss for all the samples in batch,
-                output of `_loss_fn()`.
-        
-        Returns
-        -------
-            optimize_op: Tensorflow Op
-                Optimization operation to be performed on loss.
-        """
-        with tf.variable_scope('optimization'):
-            # Select the optimizer.
-            optimizer = self.OPTIMIZERS[self.optimizer]
-
-            v_optimize_op = optimizer.minimize(v_loss_op)
-            q_optimize_op = optimizer.minimize(q_loss_op)
-            policy_optimize_op = optimizer.minimize(policy_loss_op)
-            optimize_op = tf.group(v_optimize_op, q_optimize_op, policy_optimize_op)
-            return optimize_op
+    @property
+    def trainable_variables(self):
+        return self.dense1_layer.trainable_variables + \
+                self.output_layer.trainable_variables + \
+                self.dense2_layer.trainable_variables
 
 
-    def train(self, current_states, actions, rewards, next_states):
+class SoftActorCritic:
 
-        # Create loss operation for value function update.
-        v_loss_op = self.soft_value_function_loss(current_states)
+    def __init__(self, action_dim, writer, epoch_step=1, learning_rate=0.0003,
+                 alpha=0.2, gamma=0.99,
+                polyak=0.995):
+        self.policy = Actor(action_dim)
+        self.q1 = Critic()
+        self.q2 = Critic()
+        self.target_q1 = Critic()
+        self.target_q2 = Critic()
+
+        self.writer = writer
+        self.epoch_step = epoch_step
+
+        self.alpha = tf.Variable(0.0, dtype=tf.float64)
+        self.target_entropy = -tf.constant(action_dim, dtype=tf.float64)
+        self.gamma = gamma
+        self.polyak = polyak
+
+        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate)
+        self.critic1_optimizer = tf.keras.optimizers.Adam(learning_rate)
+        self.critic2_optimizer = tf.keras.optimizers.Adam(learning_rate)
+        self.alpha_optimizer = tf.keras.optimizers.Adam(learning_rate)
 
 
+    def sample_action(self, current_state):
+        current_state_ = np.array(current_state, ndmin=2)
+        action, _ = self.policy(current_state_)
+        return action[0]
 
-        # Create loss operation for Q function update.
-        q_loss_op = self.soft_q_function_loss(current_states, actions, rewards,
-                                             next_states)
 
-        # Create loss operation for policy network update.
-        policy_loss_op = self.policy_network_loss(current_states)
+    def update_q_network(self, current_states, actions, rewards, next_states, ends):
 
-        # Combine all the loss operations
-        optimize_op = self.optimize_fn(v_loss_op, q_loss_op, policy_loss_op)
+        with tf.GradientTape() as tape1:
+            # Get Q value estimates, action used here is from the replay buffer
+            q1 = self.q1(current_states, actions)
 
-        # Log loss in tensorboard summary.
-        tf.summary.scalar('loss', v_loss_op)
-        tf.summary.scalar('loss', q_loss_op)
-        tf.summary.scalar('loss', policy_loss_op)
-        
-        # Summaries for all the trainable variables.
-        #utils.parameter_summaries(tf.trainable_variables())
+            # Sample actions from the policy for next states
+            pi_a, log_pi_a = self.policy(next_states)
 
-        # TODO: Add tensorboard model evaluation metrics.
+            # Get Q value estimates from target Q network
+            q1_target = self.target_q1(next_states, pi_a)
+            q2_target = self.target_q2(next_states, pi_a)
 
-        summary = tf.summary.merge_all()
+            # Apply the clipped double Q trick
+            # Get the minimum Q value of the 2 target networks
+            min_q_target = tf.minimum(q1_target, q2_target)
 
-        return optimize_op, v_loss_op, q_loss_op, policy_loss_op, summary
+            # Add the entropy term to get soft Q target
+            soft_q_target = min_q_target - self.alpha * log_pi_a
+            y = tf.stop_gradient(rewards + self.gamma * ends * soft_q_target)
 
-    def copy(self, primary_scope, target_scope):
+            critic1_loss = tf.reduce_mean((q1 - y)**2)
 
-        with tf.name_scope("copy"):
+        with tf.GradientTape() as tape2:
+            # Get Q value estimates, action used here is from the replay buffer
+            q2 = self.q2(current_states, actions)
 
-            primary_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=primary_scope)
-            target_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=target_scope)
+            # Sample actions from the policy for next states
+            pi_a, log_pi_a = self.policy(next_states)
 
-            primary_variables_sorted = sorted(primary_variables, key=lambda v: v.name)
-            target_variables_sorted = sorted(target_variables, key=lambda v: v.name)
+            # Get Q value estimates from target Q network
+            q1_target = self.target_q1(next_states, pi_a)
+            q2_target = self.target_q2(next_states, pi_a)
 
-            assign_ops = []
+            # Apply the clipped double Q trick
+            # Get the minimum Q value of the 2 target networks
+            min_q_target = tf.minimum(q1_target, q2_target)
 
-            for primary_var, target_var in zip(primary_variables_sorted, target_variables_sorted):
-                assign_ops.append(target_var.assign(tf.identity(primary_var)))
+            # Add the entropy term to get soft Q target
+            soft_q_target = min_q_target - self.alpha * log_pi_a
+            y = tf.stop_gradient(rewards + self.gamma * ends * soft_q_target)
 
-            copy_op = tf.group(*assign_ops)
+            critic2_loss = tf.reduce_mean((q2 - y)**2)
 
-            return copy_op
+        grads1 = tape1.gradient(critic1_loss, self.q1.trainable_variables)
+        self.critic1_optimizer.apply_gradients(zip(grads1,
+                                                   self.q1.trainable_variables))
+
+        grads2 = tape2.gradient(critic2_loss, self.q2.trainable_variables)
+        self.critic2_optimizer.apply_gradients(zip(grads2,
+                                                   self.q2.trainable_variables))
+
+        with self.writer.as_default():
+            for grad, var in zip(grads1, self.q1.trainable_variables):
+                tf.summary.histogram(f"grad-{var.name}", grad, self.epoch_step)
+                tf.summary.histogram(f"var-{var.name}", var, self.epoch_step)
+            for grad, var in zip(grads2, self.q2.trainable_variables):
+                tf.summary.histogram(f"grad-{var.name}", grad, self.epoch_step)
+                tf.summary.histogram(f"var-{var.name}", var, self.epoch_step)
+
+        return critic1_loss, critic2_loss
+
+    def update_policy_network(self, current_states):
+        with tf.GradientTape() as tape:
+            # Sample actions from the policy for current states
+            pi_a, log_pi_a = self.policy(current_states)
+
+            # Get Q value estimates from target Q network
+            q1 = self.q1(current_states, pi_a)
+            q2 = self.q2(current_states, pi_a)
+
+            # Apply the clipped double Q trick
+            # Get the minimum Q value of the 2 target networks
+            min_q = tf.minimum(q1, q2)
+
+            soft_q = min_q - self.alpha * log_pi_a
+
+            actor_loss = -tf.reduce_mean(soft_q)
+
+        variables = self.policy.trainable_variables
+        grads = tape.gradient(actor_loss, variables)
+        self.actor_optimizer.apply_gradients(zip(grads, variables))
+
+        with self.writer.as_default():
+            for grad, var in zip(grads, variables):
+                tf.summary.histogram(f"grad-{var.name}", grad, self.epoch_step)
+                tf.summary.histogram(f"var-{var.name}", var, self.epoch_step)
+
+        return actor_loss
+
+
+    def update_alpha(self, current_states):
+        with tf.GradientTape() as tape:
+            # Sample actions from the policy for current states
+            pi_a, log_pi_a = self.policy(current_states)
+
+            alpha_loss = tf.reduce_mean( - self.alpha*(log_pi_a +
+                                                       self.target_entropy))
+
+        variables = [self.alpha]
+        grads = tape.gradient(alpha_loss, variables)
+        self.alpha_optimizer.apply_gradients(zip(grads, variables))
+
+        with self.writer.as_default():
+            for grad, var in zip(grads, variables):
+                tf.summary.histogram(f"grad-{var.name}", grad, self.epoch_step)
+                tf.summary.histogram(f"var-{var.name}", var, self.epoch_step)
+
+        return alpha_loss
+
+
+    def train(self, current_states, actions, rewards, next_states, ends):
+
+        # Update Q network weights
+        critic1_loss, critic2_loss = self.update_q_network(current_states, actions, rewards, next_states, ends)
+
+        # Update policy network weights
+        actor_loss = self.update_policy_network(current_states)
+
+        alpha_loss = self.update_alpha(current_states)
+
+        # Update target Q network weights
+        #self.update_weights()
+
+        #if self.epoch_step % 10 == 0:
+        #    self.alpha = max(0.1, 0.9**(1+self.epoch_step/10000))
+        #    print("alpha: ", self.alpha, 1+self.epoch_step/10000)
+
+        return critic1_loss, critic2_loss, actor_loss, alpha_loss
+
+    def update_weights(self):
+
+        for theta_target, theta in zip(self.target_q1.trainable_variables,
+                                       self.q1.trainable_variables):
+            theta_target = self.polyak * theta_target + (1 - self.polyak) * theta
+
+        for theta_target, theta in zip(self.target_q2.trainable_variables,
+                                       self.q2.trainable_variables):
+            theta_target = self.polyak * theta_target + (1 - self.polyak) * theta
