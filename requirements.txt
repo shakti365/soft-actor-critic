@@ -19,7 +19,7 @@ Markdown==3.2.2
 numpy==1.18.4
 oauthlib==3.1.0
 opt-einsum==3.2.1
-protobuf==3.12.1
+protobuf==3.15.0
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
 pyglet==1.5.0
