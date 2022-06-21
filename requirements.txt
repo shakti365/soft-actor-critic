@@ -16,7 +16,7 @@ idna==2.9
 importlib-metadata==1.6.0
 Keras-Preprocessing==1.1.2
 Markdown==3.2.2
-numpy==1.18.4
+numpy==1.22.0
 oauthlib==3.1.0
 opt-einsum==3.2.1
 protobuf==3.12.1
